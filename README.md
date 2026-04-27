@@ -80,6 +80,8 @@ Expected output:
 
 Open `http://localhost:7474` in your browser and query the graph with Cypher:
 
+![Neo4j graph — IP and Request nodes linked by REQUEST_TO edges](assets/neo4j-graph.png)
+
 ```cypher
 // All discovered hosts, sorted by request count
 MATCH (ip:IP) RETURN ip ORDER BY ip.count DESC
