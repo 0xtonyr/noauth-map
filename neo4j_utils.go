@@ -8,83 +8,56 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
 
-// Função para testar a conexão com o banco de dados Neo4j
-func neo4jTest(password string) error {
-	ctx := context.Background()
-	dbUri := "neo4j://localhost"
-	dbUser := "neo4j"
-	// dbPassword agora é obtido do argumento da função
-	dbPassword := password
-	driver, err := neo4j.NewDriverWithContext(dbUri, neo4j.BasicAuth(dbUser, dbPassword, ""))
-	if err != nil {
-		return err
-	}
-	defer driver.Close(ctx)
-
-	err = driver.VerifyConnectivity(ctx)
-	if err != nil {
-		return err
-	}
-
-	return nil
+func newNeo4jDriver(ctx context.Context, password string) (neo4j.DriverWithContext, error) {
+	return neo4j.NewDriverWithContext("neo4j://localhost", neo4j.BasicAuth("neo4j", password, ""))
 }
 
-// Insere IPs no Neo4j
-func insertIPsIntoNeo4j(ips map[string]int, password string) error {
-	dbUri := "neo4j://localhost"
-	dbUser := "neo4j"
-	// dbPassword agora é obtido do argumento da função
-	dbPassword := password
+func neo4jTest(ctx context.Context, driver neo4j.DriverWithContext) error {
+	return driver.VerifyConnectivity(ctx)
+}
 
-	driver, err := neo4j.NewDriver(dbUri, neo4j.BasicAuth(dbUser, dbPassword, ""), func(config *neo4j.Config) {
-		config.MaxConnectionLifetime = time.Hour
-	})
-	if err != nil {
-		return fmt.Errorf("Error in Neo4j, something went wrong: %w", err)
-	}
-	defer driver.Close()
+func createConstraints(ctx context.Context, driver neo4j.DriverWithContext) error {
+	session := driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
 
-	session := driver.NewSession(neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
-	defer session.Close()
-
-	for ip, count := range ips {
-		_, err := session.WriteTransaction(func(transaction neo4j.Transaction) (interface{}, error) {
-			cypher := "MERGE (ip:IP {address: $ip}) ON CREATE SET ip.count = $count, ip.lastSeen = datetime() ON MATCH SET ip.count = ip.count + $count, ip.lastSeen = datetime()"
-			params := map[string]interface{}{
-				"ip":    ip,
-				"count": count,
-			}
-			return transaction.Run(cypher, params)
-		})
-
-		if err != nil {
-			return fmt.Errorf("Failed to insert/update IPs: %s in Neo4j: %w", ip, err)
+	for _, q := range []string{
+		"CREATE CONSTRAINT ip_address IF NOT EXISTS FOR (ip:IP) REQUIRE ip.address IS UNIQUE",
+		"CREATE CONSTRAINT req_id IF NOT EXISTS FOR (req:Request) REQUIRE req.id IS UNIQUE",
+	} {
+		query := q
+		if _, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+			return tx.Run(ctx, query, nil)
+		}); err != nil {
+			return err
 		}
 	}
-
 	return nil
 }
 
-func insertRequestsFromResultFile(resultFilePath string, password string) error {
-	dbUri := "neo4j://localhost"
-	dbUser := "neo4j"
-	dbPassword := password
+func insertIPsIntoNeo4j(ctx context.Context, driver neo4j.DriverWithContext, ips map[string]int) error {
+	session := driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
 
-	driver, err := neo4j.NewDriver(dbUri, neo4j.BasicAuth(dbUser, dbPassword, ""), func(config *neo4j.Config) {
-		config.MaxConnectionLifetime = time.Hour
-	})
-	if err != nil {
-		return fmt.Errorf("Error in Neo4j, something went wrong: %w", err)
+	for ip, count := range ips {
+		ip, count := ip, count
+		_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+			cypher := "MERGE (ip:IP {address: $ip}) ON CREATE SET ip.count = $count, ip.lastSeen = datetime() ON MATCH SET ip.count = ip.count + $count, ip.lastSeen = datetime()"
+			return tx.Run(ctx, cypher, map[string]any{"ip": ip, "count": count})
+		})
+		if err != nil {
+			return fmt.Errorf("failed to insert/update IP %s: %w", ip, err)
+		}
 	}
-	defer driver.Close()
+	return nil
+}
 
-	session := driver.NewSession(neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
-	defer session.Close()
+func insertRequestsFromResultFile(ctx context.Context, driver neo4j.DriverWithContext, resultFilePath string) error {
+	session := driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
 
 	file, err := os.Open(resultFilePath)
 	if err != nil {
@@ -93,6 +66,7 @@ func insertRequestsFromResultFile(resultFilePath string, password string) error 
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	var currentRequest []string
 
 	processRequest := func() {
@@ -101,14 +75,23 @@ func insertRequestsFromResultFile(resultFilePath string, password string) error 
 		}
 		requestData := strings.Join(currentRequest, "\n")
 
-		// SHA256 of content as stable, collision-free ID across re-runs.
 		sum := sha256.Sum256([]byte(requestData))
 		requestID := hex.EncodeToString(sum[:])
 
 		var ip, endpoint string
-		parts := strings.Fields(currentRequest[0])
-		if len(parts) > 1 {
-			endpoint = parts[1]
+		for _, line := range currentRequest {
+			for _, method := range []string{"GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS "} {
+				if strings.HasPrefix(line, method) {
+					parts := strings.Fields(line)
+					if len(parts) >= 2 {
+						endpoint = parts[1]
+					}
+					break
+				}
+			}
+			if endpoint != "" {
+				break
+			}
 		}
 		for _, line := range currentRequest {
 			if host := extractHostFromHeader(line); host != "" {
@@ -117,40 +100,35 @@ func insertRequestsFromResultFile(resultFilePath string, password string) error 
 			}
 		}
 
-		_, err := session.WriteTransaction(func(transaction neo4j.Transaction) (interface{}, error) {
+		id, content, ep, ipAddr := requestID, requestData, endpoint, ip
+		_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 			cypher := `
-                MERGE (ip:IP {address: $ip})
-                MERGE (req:Request {id: $id}) ON CREATE SET req.content = $content, req.endpoint = $endpoint
-                MERGE (req)-[:REQUEST_TO]->(ip)
-                `
-			params := map[string]interface{}{
-				"id":       requestID,
-				"content":  requestData,
-				"endpoint": endpoint,
-				"ip":       ip,
-			}
-			return transaction.Run(cypher, params)
+				MERGE (ip:IP {address: $ip})
+				MERGE (req:Request {id: $id}) ON CREATE SET req.content = $content, req.endpoint = $endpoint
+				MERGE (req)-[:REQUEST_TO]->(ip)
+			`
+			return tx.Run(ctx, cypher, map[string]any{
+				"id":       id,
+				"content":  content,
+				"endpoint": ep,
+				"ip":       ipAddr,
+			})
 		})
-
 		if err != nil {
 			fmt.Printf("Failed to insert/update Request %s in Neo4j: %s\n", requestID[:8], err)
 		}
-		currentRequest = []string{}
+		currentRequest = currentRequest[:0]
 	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "==============================" {
-			processRequest() // Processa a requisição atual
+			processRequest()
 		} else {
-			currentRequest = append(currentRequest, line) // Acumula linhas da requisição atual
+			currentRequest = append(currentRequest, line)
 		}
 	}
-	processRequest() // Assegura que a última requisição seja processada
+	processRequest()
 
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-
-	return nil
+	return scanner.Err()
 }

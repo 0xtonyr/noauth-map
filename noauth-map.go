@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -43,21 +44,19 @@ func parsePCAP(filePath string, resultFileName string) {
 	filteredRequests := filterNonAuthenticatedRequests(nonAuthenticatedRequests)
 	saveResults(filteredRequests, resultFileName)
 
-	endTime := time.Now()
-	duration := endTime.Sub(startTime)
-
-	fmt.Printf("[+] Scan completed in %.3fs\n", duration.Seconds())
+	fmt.Printf("[+] Scan completed in %.3fs\n", time.Since(startTime).Seconds())
 }
 
 func filterNonAuthenticatedRequests(requests []string) []string {
 	var nonAuthenticatedRequests []string
 
 	for _, req := range requests {
-		if !strings.Contains(req, "Proxy-Authorization") &&
-			!strings.Contains(req, "x-auth-token") &&
-			!strings.Contains(req, "x-api-key") &&
-			!strings.Contains(req, "Authorization") &&
-			!strings.Contains(req, "Cookie") {
+		lower := strings.ToLower(req)
+		if !strings.Contains(lower, "proxy-authorization") &&
+			!strings.Contains(lower, "x-auth-token") &&
+			!strings.Contains(lower, "x-api-key") &&
+			!strings.Contains(lower, "authorization") &&
+			!strings.Contains(lower, "cookie") {
 			nonAuthenticatedRequests = append(nonAuthenticatedRequests, req)
 		}
 	}
@@ -72,10 +71,14 @@ func saveResults(requests []string, filePath string) {
 	}
 	defer file.Close()
 
+	w := bufio.NewWriter(file)
 	for i, req := range requests {
-		file.WriteString("==============================\n")
-		file.WriteString(fmt.Sprintf("Packet number: %d\n", i+1))
-		file.WriteString(req + "\n")
+		fmt.Fprintf(w, "==============================\n")
+		fmt.Fprintf(w, "Packet number: %d\n", i+1)
+		fmt.Fprintf(w, "%s\n", req)
+	}
+	if err := w.Flush(); err != nil {
+		log.Fatalf("Failed to flush results file: %v", err)
 	}
 }
 
@@ -96,27 +99,17 @@ func countIPsInResultFile(resultFilePath string) (map[string]int, error) {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-	var hostIPs []string
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
+	ipCounter := make(map[string]int)
 	for scanner.Scan() {
-		request := scanner.Text()
-		ip := extractHostFromHeader(request)
-		if ip != "" {
-			hostIPs = append(hostIPs, ip)
+		if ip := extractHostFromHeader(scanner.Text()); ip != "" {
+			ipCounter[ip]++
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	ipCounter := make(map[string]int)
-	for _, ip := range hostIPs {
-		ipCounter[ip]++
-	}
-	return ipCounter, nil
+	return ipCounter, scanner.Err()
 }
-
 
 func main() {
 	neo4jPasswordFlag := flag.String("neo4jpassword", "", "Neo4j password (deprecated: use NEO4J_PASSWORD env var)")
@@ -124,12 +117,11 @@ func main() {
 
 	args := flag.Args()
 	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "Usage: ./http-filter <arquivo.pcap>")
-		fmt.Fprintln(os.Stderr, "       NEO4J_PASSWORD=<senha> ./http-filter <arquivo.pcap>")
+		fmt.Fprintln(os.Stderr, "Usage: ./noauth-map <arquivo.pcap>")
+		fmt.Fprintln(os.Stderr, "       NEO4J_PASSWORD=<senha> ./noauth-map <arquivo.pcap>")
 		os.Exit(1)
 	}
 
-	// Prefer env var; fall back to flag with a warning so credentials stay off the process list.
 	neo4jPassword := os.Getenv("NEO4J_PASSWORD")
 	if neo4jPassword == "" && *neo4jPasswordFlag != "" {
 		fmt.Fprintln(os.Stderr, "[!] Warning: -neo4jpassword exposes credentials in the process list. Use NEO4J_PASSWORD env var instead.")
@@ -146,26 +138,40 @@ func main() {
 
 	parsePCAP(filePath, resultFileName)
 
+	ctx := context.Background()
+
 	fmt.Println("[+] Starting Neo4j connection test...")
-	if err := neo4jTest(neo4jPassword); err != nil {
+	driver, err := newNeo4jDriver(ctx, neo4jPassword)
+	if err != nil {
+		fmt.Printf("[-] Failed to create Neo4j driver: %v\n", err)
+		os.Exit(1)
+	}
+	defer driver.Close(ctx)
+
+	if err := neo4jTest(ctx, driver); err != nil {
 		fmt.Printf("[-] Neo4j connection test failed: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Println("[+] Neo4j connection test succeeded.")
+
+	if err := createConstraints(ctx, driver); err != nil {
+		fmt.Printf("[-] Failed to create Neo4j constraints: %v\n", err)
+		os.Exit(1)
+	}
 
 	ipCounter, err := countIPsInResultFile(resultFileName)
 	if err != nil {
 		log.Fatalf("Error counting IPs in the results file: %v", err)
 	}
 
-	if err := insertIPsIntoNeo4j(ipCounter, neo4jPassword); err != nil {
+	if err := insertIPsIntoNeo4j(ctx, driver, ipCounter); err != nil {
 		fmt.Printf("[-] Failed to insert/update IPs in Neo4j: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Println("[+] IPs successfully inserted into Neo4j.")
 
 	fmt.Println("[+] Starting to insert requests and link them to IPs...")
-	if err := insertRequestsFromResultFile(resultFileName, neo4jPassword); err != nil {
+	if err := insertRequestsFromResultFile(ctx, driver, resultFileName); err != nil {
 		fmt.Printf("[-] Failed to insert requests in Neo4j: %v\n", err)
 		os.Exit(1)
 	}
